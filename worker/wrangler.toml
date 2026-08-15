@@ -17,7 +17,7 @@ FENETRE_JOURS = "30"
 [[d1_databases]]
 binding = "DB"
 database_name = "carte-stats"
-database_id = "PLACEHOLDER_D1_ID"
+database_id = "297410aa-5fd7-40cb-aa35-e5947ce3eabc"
 
 # Secrets à définir avec `wrangler secret put` (jamais dans ce fichier) :
 #   MOTDEPASSE      mot de passe d'accès au tableau de bord
