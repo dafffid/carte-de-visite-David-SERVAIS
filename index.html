@@ -519,13 +519,46 @@ function slug(texte) {
     .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
 
+/* ---- Canal d'arrivée : lu une fois dans l'URL, puis propagé partout ----
+   qr, partage, vcard, sig... ou "direct" si la carte est ouverte sans
+   paramètre. Nettoyé côté client ET revalidé côté serveur. */
+const SRC = (function () {
+  try {
+    const brut = new URLSearchParams(location.search).get("src") || "";
+    return slug(brut).slice(0, 20) || "direct";
+  } catch (e) { return "direct"; }
+})();
+
+/* ---- Second collecteur : endpoint Cloudflare Workers + D1 ----
+   Complète GoatCounter avec un historique illimité et le croisement
+   canal x événement. Envoi par sendBeacon (non bloquant, survit à la
+   navigation) en text/plain pour éviter tout préflight CORS. Hors-ligne
+   ou endpoint injoignable, l'échec est silencieux et sans effet. */
+const COLLECTE = "https://carte-stats.david-servais80.workers.dev/collect";
+function envoyer(nom) {
+  try {
+    const corps = JSON.stringify({ ev: nom, src: SRC });
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon(COLLECTE, new Blob([corps], { type: "text/plain" }));
+    } else {
+      fetch(COLLECTE, { method: "POST", body: corps, keepalive: true }).catch(() => {});
+    }
+  } catch (e) { /* la mesure ne doit jamais casser la carte */ }
+}
+
+// Point d'entrée unique : les deux collecteurs, aucun ne peut faire échouer l'autre.
+function mesurer(nom) { track(nom); envoyer(nom); }
+
 // Un seul écouteur, en phase de capture : l'événement part en parallèle du
 // clic, sans preventDefault, donc aucune navigation n'est retardée ni bloquée
 // (liens tel:, sms:, mailto:, externes compris).
 document.addEventListener("click", (e) => {
   const cible = e.target && e.target.closest && e.target.closest("[data-ev]");
-  if (cible) track(cible.getAttribute("data-ev"));
+  if (cible) mesurer(cible.getAttribute("data-ev"));
 }, true);
+
+// Vue de page côté Worker (GoatCounter compte la sienne de son côté).
+envoyer("visite");
 
 // Couleurs de marque
 document.documentElement.style.setProperty("--brand", c.couleur);
@@ -555,11 +588,15 @@ if (c.expertises && c.expertises.length) {
 
 // CTA signature RDV
 if (c.rdv && c.rdv.url) {
+  // Le canal d'arrivée est propagé en UTM jusqu'à la page de réservation,
+  // pour retrouver l'origine d'un RDV dans TidyCal en plus du clic mesuré.
+  const lienRdv = c.rdv.url + (c.rdv.url.indexOf("?") === -1 ? "?" : "&") +
+    "utm_source=carte-visite&utm_medium=" + encodeURIComponent(SRC) + "&utm_campaign=symbotis";
   const cta = document.getElementById("ctaRdv");
-  cta.href = c.rdv.url;
+  cta.href = lienRdv;
   cta.textContent = c.rdv.titre;
   document.getElementById("ctaMention").textContent = c.rdv.mention || "";
-  document.getElementById("flottantRdv").href = c.rdv.url;
+  document.getElementById("flottantRdv").href = lienRdv;
 } else {
   document.getElementById("ctaRdv").hidden = true;
   document.getElementById("ctaMention").hidden = true;

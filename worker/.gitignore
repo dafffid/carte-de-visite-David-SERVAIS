@@ -1,0 +1,4 @@
+# Secrets de développement local : ne doivent jamais partir sur GitHub.
+.dev.vars
+.wrangler/
+node_modules/

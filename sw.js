@@ -1,8 +1,10 @@
-const CACHE = "carte-symbotis-v2";
+const CACHE = "carte-symbotis-v3";
 const FICHIERS = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png"];
 
-// Hôtes analytics : jamais interceptés, jamais mis en cache (network-only).
-const ANALYTICS = ["goatcounter.com", "gc.zgo.at"];
+// Hôtes de mesure : jamais interceptés, jamais mis en cache (network-only).
+// workers.dev = l'endpoint de collecte Cloudflare (POST, à ne jamais servir
+// depuis le cache et à ne jamais retenir).
+const ANALYTICS = ["goatcounter.com", "gc.zgo.at", "workers.dev"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(FICHIERS)));

@@ -1,0 +1,25 @@
+name = "carte-stats"
+main = "src/index.js"
+compatibility_date = "2026-07-09"
+account_id = "245083b0d8ad33c6546df4df78ddf412"
+
+workers_dev = true
+
+[observability]
+enabled = true
+
+[vars]
+# Seule origine autorisée à déposer des événements.
+ORIGINE_AUTORISEE = "https://dafffid.github.io"
+# Nombre de jours affichés par défaut sur le tableau de bord.
+FENETRE_JOURS = "30"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "carte-stats"
+database_id = "PLACEHOLDER_D1_ID"
+
+# Secrets à définir avec `wrangler secret put` (jamais dans ce fichier) :
+#   MOTDEPASSE      mot de passe d'accès au tableau de bord
+#   SECRET_SESSION  clé de signature du cookie de session admin
+#   SEL_EMPREINTE   sel du hash quotidien anonymisant les visiteurs
