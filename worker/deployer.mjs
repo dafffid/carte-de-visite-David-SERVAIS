@@ -131,6 +131,19 @@ for (const nom of ["SECRET_SESSION", "SEL_EMPREINTE"]) {
   else console.log(`${nom} déjà défini, conservé`);
 }
 
+// Jeton TidyCal : lu dans le coffre, jamais écrit sur disque ni affiché.
+if (!deja.includes("TIDYCAL_TOKEN")) {
+  try {
+    const { getSecret } = await import("file:///" + VAULT.replace(/\\/g, "/"));
+    aPousser.push(["TIDYCAL_TOKEN", getSecret("TIDYCAL", "api_token")]);
+  } catch (e) {
+    console.log(`TIDYCAL_TOKEN introuvable dans le coffre (${e.message}).`);
+    console.log("La synchronisation des rendez-vous restera inactive jusqu'à ce qu'il soit défini.");
+  }
+} else {
+  console.log("TIDYCAL_TOKEN déjà défini, conservé");
+}
+
 for (const [nom, valeur] of aPousser) {
   wrangler(["secret", "put", nom], { entree: valeur + "\n" });
   console.log(`${nom} poussé`);

@@ -8,6 +8,11 @@ workers_dev = true
 [observability]
 enabled = true
 
+# Synchronisation horaire des rendez-vous TidyCal (minute 17, pour éviter
+# l'heure pile où tout le monde planifie).
+[triggers]
+crons = ["17 * * * *"]
+
 [vars]
 # Seule origine autorisée à déposer des événements.
 ORIGINE_AUTORISEE = "https://dafffid.github.io"
@@ -23,3 +28,4 @@ database_id = "297410aa-5fd7-40cb-aa35-e5947ce3eabc"
 #   MOTDEPASSE      mot de passe d'accès au tableau de bord
 #   SECRET_SESSION  clé de signature du cookie de session admin
 #   SEL_EMPREINTE   sel du hash quotidien anonymisant les visiteurs
+#   TIDYCAL_TOKEN   jeton API TidyCal, lecture des réservations

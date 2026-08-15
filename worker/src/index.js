@@ -16,6 +16,11 @@ const DUREE_SESSION = 7 * 24 * 3600; // secondes
 const TAILLE_MAX_CORPS = 512; // octets acceptés sur /collect
 const RETENTION_JOURS = 400; // purge opportuniste au-delà
 
+// Fenêtre de rapprochement entre un clic « Prendre RDV » et une réservation
+// TidyCal. Au-delà, on considère qu'on ne peut plus relier les deux.
+const FENETRE_RAPPROCHEMENT_MIN = 120;
+const TIDYCAL_API = "https://tidycal.com/api/bookings";
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -30,6 +35,14 @@ export default {
       if (chemin === "/" || chemin === "/stats") return pageStats(request, env);
       if (chemin === "/connexion" && request.method === "POST") return connexion(request, env);
       if (chemin === "/deconnexion") return deconnexion();
+      // Synchronisation manuelle, réservée à une session authentifiée.
+      if (chemin === "/synchro") {
+        if (!(await sessionValide(request, env))) return texte("Non autorisé", 401);
+        const bilan = await synchroniserReservations(env);
+        return new Response(JSON.stringify(bilan, null, 2), {
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        });
+      }
       return texte("Introuvable", 404);
     } catch (e) {
       // On ne renvoie jamais le détail interne au client.
@@ -37,7 +50,143 @@ export default {
       return texte("Erreur interne", 500);
     }
   },
+
+  // Déclenché par le CRON Cloudflare, toutes les heures.
+  async scheduled(evenement, env, ctx) {
+    ctx.waitUntil(
+      synchroniserReservations(env)
+        .then((bilan) => console.log("synchro TidyCal:", JSON.stringify(bilan)))
+        .catch((e) => console.error("synchro TidyCal en échec:", String(e)))
+    );
+  },
 };
+
+/* ============================================================
+   SYNCHRONISATION DES RENDEZ-VOUS TIDYCAL
+   ============================================================
+
+   TidyCal ne renvoie aucun paramètre UTM sur ses réservations : le champ
+   `source` vaut « web » ou rien. Le canal d'origine est donc déduit du
+   dernier clic « Prendre RDV » enregistré dans les deux heures précédant
+   la réservation. C'est un rapprochement temporel, pas une preuve : on
+   conserve l'écart en minutes pour pouvoir juger chaque rattachement.
+
+   Aucune donnée personnelle du prospect n'est lue ni stockée : ni nom,
+   ni email, ni identifiant de contact. */
+
+async function lireMeta(env, cle) {
+  const ligne = await env.DB.prepare("SELECT valeur FROM meta WHERE cle = ?").bind(cle).first();
+  return ligne ? ligne.valeur : null;
+}
+
+async function ecrireMeta(env, cle, valeur) {
+  await env.DB.prepare(
+    "INSERT INTO meta (cle, valeur) VALUES (?, ?) ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur"
+  )
+    .bind(cle, valeur)
+    .run();
+}
+
+/** Récupère les réservations TidyCal, en s'arrêtant à 10 pages par sécurité. */
+async function reservationsTidycal(env) {
+  const toutes = [];
+  for (let page = 1; page <= 10; page++) {
+    const reponse = await fetch(`${TIDYCAL_API}?page=${page}`, {
+      headers: {
+        Authorization: `Bearer ${env.TIDYCAL_TOKEN}`,
+        Accept: "application/json",
+      },
+    });
+    if (!reponse.ok) throw new Error(`TidyCal a répondu ${reponse.status}`);
+    const charge = await reponse.json();
+    const lot = charge.data || [];
+    // On ne garde que le strict nécessaire : rien de nominatif ne va plus loin.
+    // Les dates sont normalisées en ISO à la milliseconde, car TidyCal renvoie
+    // des microsecondes : sans ça, les comparaisons de chaînes avec notre
+    // propre repère seraient bancales.
+    for (const b of lot) {
+      const date = new Date(b.created_at);
+      if (Number.isNaN(date.getTime())) continue;
+      toutes.push({
+        id: b.id,
+        cree_le: date.toISOString(),
+        annule: b.cancelled_at ? 1 : 0,
+      });
+    }
+    if (!charge.last_page || page >= charge.last_page) break;
+  }
+  return toutes;
+}
+
+/** Cherche le dernier clic RDV dans la fenêtre précédant la réservation. */
+async function canalDuClicPrecedent(env, dateReservation) {
+  const fin = new Date(dateReservation);
+  if (Number.isNaN(fin.getTime())) return { src: "inconnu", ecart: null };
+  const debut = new Date(fin.getTime() - FENETRE_RAPPROCHEMENT_MIN * 60000);
+  const ligne = await env.DB.prepare(
+    `SELECT src, horodatage FROM evenement
+      WHERE nom LIKE 'clic-rdv%' AND horodatage <= ? AND horodatage >= ?
+      ORDER BY horodatage DESC LIMIT 1`
+  )
+    .bind(fin.toISOString(), debut.toISOString())
+    .first();
+  if (!ligne) return { src: "inconnu", ecart: null };
+  const ecart = Math.round((fin.getTime() - new Date(ligne.horodatage).getTime()) / 60000);
+  return { src: ligne.src, ecart };
+}
+
+async function synchroniserReservations(env) {
+  if (!env.TIDYCAL_TOKEN) return { statut: "jeton TidyCal absent", nouvelles: 0 };
+
+  const maintenant = new Date().toISOString();
+
+  // Repère : au tout premier passage, on part de l'instant présent afin de ne
+  // pas importer l'historique antérieur à la mise en place du traçage, qui
+  // serait entièrement « inconnu » et fausserait les taux.
+  let repere = await lireMeta(env, "tidycal_repere");
+  if (!repere) {
+    await ecrireMeta(env, "tidycal_repere", maintenant);
+    return { statut: "premier passage, repère posé", repere: maintenant, nouvelles: 0 };
+  }
+
+  const reservations = await reservationsTidycal(env);
+  const nouvelles = reservations.filter((r) => r.cree_le && r.cree_le > repere);
+
+  let rattachees = 0;
+  for (const r of nouvelles) {
+    const { src, ecart } = await canalDuClicPrecedent(env, r.cree_le);
+    if (src !== "inconnu") rattachees++;
+    await env.DB.prepare(
+      `INSERT INTO reservation (booking_id, src, minutes_apres_clic, cree_le, jour, annule, synchronise_le)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(booking_id) DO UPDATE SET annule = excluded.annule, synchronise_le = excluded.synchronise_le`
+    )
+      .bind(r.id, src, ecart, r.cree_le, String(r.cree_le).slice(0, 10), r.annule, maintenant)
+      .run();
+  }
+
+  // Les annulations concernent aussi des réservations déjà enregistrées.
+  const dejaConnues = reservations.filter((r) => r.cree_le && r.cree_le <= repere && r.annule);
+  for (const r of dejaConnues) {
+    await env.DB.prepare("UPDATE reservation SET annule = 1, synchronise_le = ? WHERE booking_id = ?")
+      .bind(maintenant, r.id)
+      .run();
+  }
+
+  if (nouvelles.length) {
+    const plusRecente = nouvelles.map((r) => r.cree_le).sort().pop();
+    await ecrireMeta(env, "tidycal_repere", plusRecente);
+  }
+  await ecrireMeta(env, "tidycal_derniere_synchro", maintenant);
+
+  return {
+    statut: "ok",
+    examinees: reservations.length,
+    nouvelles: nouvelles.length,
+    rattachees_a_un_canal: rattachees,
+    repere_precedent: repere,
+  };
+}
 
 /* ============================================================
    COLLECTE
@@ -223,7 +372,7 @@ async function collecterStats(env, fenetre) {
   const depuis = jourMoins(fenetre);
   const db = env.DB;
 
-  const [totaux, entonnoir, canaux, parJour, evenements, pays] = await Promise.all([
+  const [totaux, entonnoir, canaux, parJour, evenements, pays, reservations, reservationsCanal, derniereSynchro] = await Promise.all([
     db
       .prepare(
         `SELECT
@@ -287,7 +436,33 @@ async function collecterStats(env, fenetre) {
       )
       .bind(depuis)
       .all(),
+
+    db
+      .prepare(
+        `SELECT COUNT(*) AS total,
+                SUM(CASE WHEN src <> 'inconnu' THEN 1 ELSE 0 END) AS rattachees
+         FROM reservation WHERE jour >= ? AND annule = 0`
+      )
+      .bind(depuis)
+      .first(),
+
+    db
+      .prepare(
+        `SELECT src, COUNT(*) AS reservations
+         FROM reservation WHERE jour >= ? AND annule = 0
+         GROUP BY src`
+      )
+      .bind(depuis)
+      .all(),
+
+    db.prepare("SELECT valeur FROM meta WHERE cle = 'tidycal_derniere_synchro'").first(),
   ]);
+
+  // Réservations indexées par canal, pour enrichir le tableau des canaux.
+  const parCanal = {};
+  for (const l of (reservationsCanal && reservationsCanal.results) || []) {
+    parCanal[l.src] = Number(l.reservations) || 0;
+  }
 
   return {
     depuis,
@@ -298,6 +473,9 @@ async function collecterStats(env, fenetre) {
     parJour: (parJour && parJour.results) || [],
     evenements: (evenements && evenements.results) || [],
     pays: (pays && pays.results) || [],
+    reservations: reservations || {},
+    reservationsParCanal: parCanal,
+    derniereSynchro: derniereSynchro ? derniereSynchro.valeur : null,
   };
 }
 
@@ -430,15 +608,17 @@ function graphique(parJour, fenetre) {
 </p>`;
 }
 
-function blocEntonnoir(e) {
+function blocEntonnoir(e, nbReservations) {
   const v = Number(e.etape_visite) || 0;
   const i = Number(e.etape_interaction) || 0;
   const r = Number(e.etape_rdv) || 0;
-  const max = Math.max(1, v, i, r);
+  const res = Number(nbReservations) || 0;
+  const max = Math.max(1, v, i, r, res);
   const etapes = [
     ["Visiteurs de la carte", v, null],
     ["Ont cliqué quelque chose", i, v],
     ["Ont cliqué Prendre RDV", r, v],
+    ["Ont réservé (TidyCal)", res, v],
   ];
   return etapes
     .map(([nom, valeur, base]) => {
@@ -472,6 +652,7 @@ const NOMS_CANAUX = {
   partage: "Bouton partager",
   vcard: "vCard (contact)",
   direct: "Direct / inconnu",
+  inconnu: "Non rattaché",
 };
 
 async function pageStats(request, env) {
@@ -492,6 +673,17 @@ async function pageStats(request, env) {
   const visiteurs = Number(t.visiteurs) || 0;
   const clicsRdv = Number(t.clics_rdv) || 0;
   const interactions = Number(t.interactions) || 0;
+  const nbReservations = Number(s.reservations.total) || 0;
+  const nbRattachees = Number(s.reservations.rattachees) || 0;
+
+  // Un canal peut avoir des réservations sans visite dans la fenêtre (ou être
+  // « inconnu ») : on complète le tableau pour ne rien perdre en route.
+  const canauxAffiches = s.canaux.slice();
+  for (const src of Object.keys(s.reservationsParCanal)) {
+    if (!canauxAffiches.some((c) => c.src === src)) {
+      canauxAffiches.push({ src, visites: 0, visiteurs: 0, clics_rdv: 0 });
+    }
+  }
 
   const onglet = (n, libelle) =>
     `<a href="/stats?jours=${n}" class="${n === fenetre ? "actif" : ""}">${libelle}</a>`;
@@ -511,12 +703,22 @@ async function pageStats(request, env) {
   <div class="tuile"><div class="valeur">${visiteurs}</div><div class="label">Visiteurs</div></div>
   <div class="tuile"><div class="valeur">${interactions}</div><div class="label">Interactions</div></div>
   <div class="tuile"><div class="valeur">${clicsRdv}</div><div class="label">Clics RDV</div></div>
-  <div class="tuile"><div class="valeur">${pourcent(clicsRdv, visites)}</div><div class="label">Taux RDV</div></div>
+  <div class="tuile"><div class="valeur">${nbReservations}</div><div class="label">RDV pris</div></div>
+  <div class="tuile"><div class="valeur">${pourcent(nbReservations, visites)}</div><div class="label">Taux de conversion</div></div>
 </div>
 
 <h2>Entonnoir de conversion</h2>
-<div class="carte">${blocEntonnoir(s.entonnoir)}
-  <p class="sous" style="margin-top:10px">Pourcentages calculés sur les visiteurs distincts, pas sur les clics.</p>
+<div class="carte">${blocEntonnoir(s.entonnoir, nbReservations)}
+  <p class="sous" style="margin-top:10px">
+    Les trois premières étapes comptent des visiteurs distincts. La dernière compte des
+    réservations TidyCal confirmées (non annulées)&nbsp;: une même personne qui réserve
+    deux fois compte deux fois.
+    ${
+      s.derniereSynchro
+        ? `Dernière synchronisation TidyCal&nbsp;: ${echapper(s.derniereSynchro.slice(0, 16).replace("T", " à "))} UTC.`
+        : "Aucune synchronisation TidyCal effectuée pour l'instant."
+    }
+  </p>
 </div>
 
 <h2>Visites par jour</h2>
@@ -524,17 +726,25 @@ async function pageStats(request, env) {
 
 <h2>Canaux d'arrivée</h2>
 <div class="carte">${tableau(
-    ["Canal", "Visites", "Visiteurs", "Clics RDV", "Taux RDV"],
-    s.canaux.map((c) => [
+    ["Canal", "Visites", "Visiteurs", "Clics RDV", "RDV pris", "Conversion"],
+    canauxAffiches.map((c) => [
       NOMS_CANAUX[c.src] || c.src,
       c.visites || 0,
       c.visiteurs || 0,
       c.clics_rdv || 0,
-      pourcent(c.clics_rdv, c.visites),
+      s.reservationsParCanal[c.src] || 0,
+      pourcent(s.reservationsParCanal[c.src] || 0, c.visites),
     ]),
     "Aucune donnée sur la période."
   )}
-  <p class="sous" style="margin-top:10px">« Direct / inconnu » : ouverture sans paramètre <code>?src=</code>.</p>
+  <p class="sous" style="margin-top:10px">
+    « Direct / inconnu »&nbsp;: ouverture sans paramètre <code>?src=</code>.
+    ${
+      nbReservations
+        ? `${nbRattachees} réservation(s) sur ${nbReservations} ont pu être rattachées à un canal.`
+        : ""
+    }
+  </p>
 </div>
 
 <h2>Détail des interactions</h2>
@@ -555,6 +765,13 @@ async function pageStats(request, env) {
   Mesure sans cookie et sans donnée personnelle : ni adresse IP ni user-agent ne sont
   stockés. Les visiteurs sont comptés via une empreinte hachée avec un sel secret et la
   date du jour, irréversible et renouvelée chaque nuit. Rétention ${RETENTION_JOURS} jours.
+  <br><br>
+  Les rendez-vous sont relus chaque heure dans TidyCal : seuls l'identifiant technique de
+  la réservation, sa date et son canal déduit sont conservés. Aucun nom, aucune adresse
+  email, aucun contact de prospect n'entre dans cette base. TidyCal ne transmettant pas
+  les paramètres UTM, le canal est déduit du dernier clic « Prendre RDV » survenu dans les
+  ${FENETRE_RAPPROCHEMENT_MIN} minutes précédentes : c'est un rapprochement probable, pas
+  une certitude.
 </p>`;
 
   return new Response(enveloppe("Statistiques de la carte", contenu), {
